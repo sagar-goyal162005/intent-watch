@@ -25,33 +25,18 @@ const navItems = [
 
 export function Layout({ children }: { children: React.ReactNode }) {
   const location = useLocation();
-  const [themeColor, setThemeColor] = useState<ThemeColor>('purple');
-  const [uiMode, setUiMode] = useState<UiMode>('default');
+  // Theme is fixed: Dark UI + Purple brand color.
+  const [themeColor] = useState<ThemeColor>('purple');
+  const [uiMode] = useState<UiMode>('dark');
 
   useEffect(() => {
-    const readSettings = () => {
-      try {
-        const raw = window.localStorage.getItem('intentwatch.themeColor');
-        if (raw === 'purple' || raw === 'blue' || raw === 'green' || raw === 'red' || raw === 'orange' || raw === 'vibrant') {
-          setThemeColor(raw);
-        }
-
-        const rawUi = window.localStorage.getItem('intentwatch.uiMode');
-        if (rawUi === 'default' || rawUi === 'dark' || rawUi === 'light' || rawUi === 'colorful' || rawUi === 'vibrant') {
-          setUiMode(rawUi);
-        }
-      } catch {
-        // ignore
-      }
-    };
-
-    readSettings();
-    window.addEventListener('intentwatch:theme', readSettings as EventListener);
-    window.addEventListener('intentwatch:ui', readSettings as EventListener);
-    return () => {
-      window.removeEventListener('intentwatch:theme', readSettings as EventListener);
-      window.removeEventListener('intentwatch:ui', readSettings as EventListener);
-    };
+    // Best-effort: keep stored preferences aligned with the fixed UI.
+    try {
+      window.localStorage.setItem('intentwatch.themeColor', 'purple');
+      window.localStorage.setItem('intentwatch.uiMode', 'dark');
+    } catch {
+      // ignore
+    }
   }, []);
 
   useEffect(() => {

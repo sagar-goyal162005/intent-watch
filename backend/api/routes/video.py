@@ -8,6 +8,8 @@ import os
 import shutil
 import time
 import threading
+import uuid
+from typing import TypedDict
 import cv2
 from ultralytics import YOLO
 from api.routes.alerts import add_alert
@@ -28,7 +30,7 @@ WORKSPACE_DIR = BACKEND_DIR.parent
 VIDEO_DIR = BACKEND_DIR / "data" / "videos"
 VIDEO_DIR.mkdir(parents=True, exist_ok=True)
 
-MODEL_CANDIDATES = [BACKEND_DIR / "yolov8n.pt", WORKSPACE_DIR / "yolov8n.pt"]
+MODEL_CANDIDATES = [BACKEND_DIR / "yolov8n.pt"]
 
 LOITER_THRESHOLD = 5        # seconds (reduced for faster detection)
 BAG_THRESHOLD = 5           # seconds (reduced for faster detection)  
@@ -40,8 +42,14 @@ RUNNING_ACCELERATION_THRESHOLD = 60  # px/s² (large speed increase needed)
 stream_lock = threading.Lock()
 
 # ---------------- GLOBAL STATE ----------------
-current_video_source = {"mode": None, "path": None}
+class VideoSourceState(TypedDict):
+    mode: str | None
+    path: str | int | None
+
+
+current_video_source: VideoSourceState = {"mode": None, "path": None}
 cap = None
+stream_generation = 0  # increments whenever we stop/switch sources to cancel old streams
 
 person_start_time = None
 bag_start_time = None
@@ -59,6 +67,21 @@ class StartCameraRequest(BaseModel):
 
 class StartVideoRequest(BaseModel):
     source: str
+
+
+def _safe_filename(name: str) -> str:
+    # Keep it simple: remove path separators and trim.
+    name = (name or "video").strip().replace("\\", "_").replace("/", "_")
+    return name if name else "video"
+
+
+def _unique_upload_path(original_filename: str) -> Path:
+    base = _safe_filename(original_filename)
+    stem, ext = os.path.splitext(base)
+    ext = ext.lower()
+    # Always create a unique filename to prevent overwriting a file that is currently being streamed.
+    suffix = time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:8]
+    return VIDEO_DIR / f"{stem}_{suffix}{ext}"
 
 def open_capture(source):
     if isinstance(source, int) and os.name == "nt":
@@ -78,9 +101,14 @@ def open_capture(source):
 
 
 def reset_stream_state():
-    global cap, person_start_time, bag_start_time, person_positions, person_speed_history, frame_count, last_frame_time
+    global cap, stream_generation, person_start_time, bag_start_time, person_positions, person_speed_history, frame_count, last_frame_time
+    # Bump generation first so any in-flight stream generators exit quickly.
+    stream_generation += 1
     if cap:
-        cap.release()
+        try:
+            cap.release()
+        except Exception:
+            pass
         cap = None
     person_start_time = None
     bag_start_time = None
@@ -128,25 +156,21 @@ def upload_video(file: UploadFile = File(...)):
                 detail=f"Unsupported format. Allowed: {', '.join(allowed_extensions)}",
             )
         
-        file_path = VIDEO_DIR / file.filename
+        file_path = _unique_upload_path(file.filename)
+        tmp_path = file_path.with_suffix(file_path.suffix + ".tmp")
         
-        # Save file
-        with open(file_path, "wb") as buffer:
+        # Save file (write to temp then rename for best-effort atomicity)
+        with open(tmp_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
+        os.replace(tmp_path, file_path)
         
         # Validate that file was written
         if not file_path.exists() or file_path.stat().st_size == 0:
             raise HTTPException(status_code=400, detail="File upload failed or file is empty")
-        
-        # Validate video can be opened
-        test_cap = cv2.VideoCapture(str(file_path))
-        if not test_cap.isOpened():
-            try:
-                file_path.unlink(missing_ok=True)
-            except Exception:
-                pass
-            raise HTTPException(status_code=400, detail="Invalid video file or unsupported codec")
-        test_cap.release()
+
+        # NOTE: Do not attempt to open the video with OpenCV here.
+        # Some codecs/containers can cause VideoCapture to hang on Windows.
+        # Streaming will surface an error if the codec is unsupported.
         
         reset_stream_state()
         abs_path = str(file_path.resolve())
@@ -154,7 +178,8 @@ def upload_video(file: UploadFile = File(...)):
         
         print(f"✓ Video uploaded successfully: {abs_path}")
         return {"message": "Video uploaded successfully", "path": abs_path, "filename": file.filename}
-    
+    except HTTPException:
+        raise
     except Exception as e:
         error_msg = str(e)
         print(f"✗ Upload error: {error_msg}")
@@ -205,15 +230,22 @@ def start_video(body: StartVideoRequest):
             except Exception:
                 source = source_raw
 
-        # Validate the source can be opened.
-        test_cap = open_capture(source)
-        if not test_cap.isOpened():
-            try:
-                test_cap.release()
-            except Exception:
-                pass
-            raise HTTPException(status_code=500, detail="Video source not available")
-        test_cap.release()
+        # Validation strategy:
+        # - Camera devices: validate by attempting to open (fast failure if device busy).
+        # - File paths / URLs: do NOT open with OpenCV here (can hang on some codecs on Windows).
+        if isinstance(source, int):
+            test_cap = open_capture(source)
+            if not test_cap.isOpened():
+                try:
+                    test_cap.release()
+                except Exception:
+                    pass
+                raise HTTPException(status_code=500, detail="Camera not available")
+            test_cap.release()
+        else:
+            # If it's a local file path, ensure it exists. URLs/RTSP may not exist as files.
+            if os.path.exists(str(source)) is False and ("://" not in str(source)):
+                raise HTTPException(status_code=404, detail="Video file not found")
 
         reset_stream_state()
         current_video_source.update(
@@ -228,9 +260,10 @@ def start_video(body: StartVideoRequest):
 @router.post("/stop")
 def stop_video():
     """Stop video stream"""
-    global cap
+    global cap, current_video_source
     try:
         reset_stream_state()
+        current_video_source.update({"mode": None, "path": None})
         print("✓ Video stream stopped")
         return {"message": "Video stream stopped"}
     except Exception as e:
@@ -243,23 +276,26 @@ def video_status():
 
 # ---------------- STREAM + INTENT ----------------
 
-def frame_generator(source):
-    global cap, person_start_time, bag_start_time, person_positions, person_speed_history, frame_count, last_frame_time
+def frame_generator(source, generation: int):
+    global cap, stream_generation, person_start_time, bag_start_time, person_positions, person_speed_history, frame_count, last_frame_time
 
     frames_processed = 0
     fps_limit = 30
     
+    cap_local = None
+
     try:
         # Disable threading to avoid FFmpeg codec issues
-        if isinstance(source, int):
-            cap = open_capture(source)
-            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Single buffer for camera
-        else:
-            cap = open_capture(source)
+        cap_local = open_capture(source)
+        cap = cap_local
+
+        if isinstance(source, int) and cap_local is not None:
+            cap_local.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Single buffer for camera
+        elif cap_local is not None:
             # Disable multithreading for file reading
-            cap.set(cv2.CAP_PROP_AUTOFOCUS, 0)
-        
-        if not cap.isOpened():
+            cap_local.set(cv2.CAP_PROP_AUTOFOCUS, 0)
+
+        if cap_local is None or not cap_local.isOpened():
             print(f"✗ Failed to open: {source}")
             return
 
@@ -268,11 +304,16 @@ def frame_generator(source):
 
         while True:
             try:
-                ret, frame = cap.read()
+                # Cancel this generator if a new source was selected or stream was stopped.
+                if generation != stream_generation:
+                    break
+
+                ret, frame = cap_local.read()
                 if not ret or frame is None:
                     if isinstance(source, str):
-                        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                        ret, frame = cap.read()
+                        # Loop file video back to start.
+                        cap_local.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                        ret, frame = cap_local.read()
                         if not ret or frame is None:
                             break
                     else:
@@ -463,18 +504,34 @@ def frame_generator(source):
                        b"Content-Type: image/jpeg\r\n\r\n" + buf.tobytes() + b"\r\n")
 
             except Exception as e:
+                # If we're cancelled, exit; otherwise avoid an infinite error loop.
+                if generation != stream_generation:
+                    break
                 print(f"✗ Frame error: {str(e)}")
+                time.sleep(0.05)
+                # If capture is no longer valid, exit.
+                if cap_local is None or (hasattr(cap_local, "isOpened") and not cap_local.isOpened()):
+                    break
                 continue
 
         print(f"✓ Stream ended. Processed {frames_processed} frames")
-        cap.release()
-        cap = None
+        try:
+            if cap_local is not None:
+                cap_local.release()
+        except Exception:
+            pass
+        if cap is cap_local:
+            cap = None
 
     except Exception as e:
         print(f"✗ Critical error: {str(e)}")
-        if cap:
-            cap.release()
-        cap = None
+        try:
+            if cap_local is not None:
+                cap_local.release()
+        except Exception:
+            pass
+        if cap is cap_local:
+            cap = None
 @router.get("/stream")
 def stream_video():
     if current_video_source["mode"] is None:
@@ -489,8 +546,9 @@ def stream_video():
             raise HTTPException(status_code=404, detail=f"Video file not found: {source}")
     
     try:
+        gen = stream_generation
         return StreamingResponse(
-            frame_generator(source),
+            frame_generator(source, gen),
             media_type="multipart/x-mixed-replace; boundary=frame"
         )
     except Exception as e:

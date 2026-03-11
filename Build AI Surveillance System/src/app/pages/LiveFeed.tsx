@@ -7,31 +7,57 @@ import {
   Pause, 
   Upload, 
   Video, 
-  Users, 
   AlertTriangle,
   Activity,
   Camera,
-  Maximize
 } from 'lucide-react';
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '../components/ui/select';
 import { videoAPI, alertsAPI, Alert } from '../../services/api';
 
 export function LiveFeed() {
   const [isStreaming, setIsStreaming] = useState(false);
   const [alerts, setAlerts] = useState<Alert[]>([]);
-  const [videoSource, setVideoSource] = useState<string>('webcam');
+  const [activeSource, setActiveSource] = useState<'webcam' | 'file'>('webcam');
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [streamNonce, setStreamNonce] = useState(0);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const reconnectAttemptsRef = useRef(0);
+  const isMountedRef = useRef(true);
+  const isStreamingRef = useRef(false);
   const streamUrl = `${videoAPI.getStreamUrl()}?t=${streamNonce}`;
+
+  // Track mount/unmount to avoid setting state after navigation.
+  useEffect(() => {
+    isMountedRef.current = true;
+    return () => {
+      isMountedRef.current = false;
+    };
+  }, []);
+
+  // Keep a ref of streaming state for unmount cleanup.
+  useEffect(() => {
+    isStreamingRef.current = isStreaming;
+  }, [isStreaming]);
+
+  // IMPORTANT: Stop the backend stream when navigating away from Live Feed.
+  // Otherwise the MJPEG stream + AI processing can keep running in the background
+  // and make the whole app feel stuck when switching tabs.
+  useEffect(() => {
+    return () => {
+      void videoAPI.stopVideo().catch(() => {
+        // ignore
+      });
+    };
+  }, []);
 
   // Fetch alerts periodically
   useEffect(() => {
     const fetchAlerts = async () => {
       try {
         const data = await alertsAPI.getLiveAlerts();
-        setAlerts(Array.isArray(data) ? data.slice(-5) : []); // Get last 5 alerts
+        if (isMountedRef.current) {
+          setAlerts(Array.isArray(data) ? data.slice(-5) : []); // Get last 5 alerts
+        }
       } catch (error) {
         console.error('Error fetching alerts:', error);
       }
@@ -49,26 +75,34 @@ export function LiveFeed() {
     try {
       if (isStreaming) {
         await videoAPI.stopVideo();
-        setIsStreaming(false);
+        if (isMountedRef.current) {
+          setIsStreaming(false);
+          setActiveSource('webcam');
+        }
+        reconnectAttemptsRef.current = 0;
       } else {
-        if (videoSource === 'webcam') {
-          const response = await videoAPI.startWebcam(0);
-          console.log('Webcam started:', response);
-        } else if (videoSource === 'file') {
-          // Handled by file upload
-          setIsLoading(false);
-          return;
+        const response = await videoAPI.startWebcam(0);
+        console.log('Webcam started:', response);
+        if (isMountedRef.current) {
+          setActiveSource('webcam');
         }
         // Force browser to reconnect to the MJPEG stream
-        setStreamNonce((n) => n + 1);
-        setIsStreaming(true);
+        reconnectAttemptsRef.current = 0;
+        if (isMountedRef.current) {
+          setStreamNonce((n) => n + 1);
+          setIsStreaming(true);
+        }
       }
     } catch (error: any) {
       console.error('Error toggling stream:', error);
-      setError(error.message || 'Failed to start/stop stream');
+      if (isMountedRef.current) {
+        setError(error.message || 'Failed to start/stop stream');
+      }
       alert('Failed to start/stop stream. Make sure the backend is running on http://localhost:8000');
     } finally {
-      setIsLoading(false);
+      if (isMountedRef.current) {
+        setIsLoading(false);
+      }
     }
   };
 
@@ -79,18 +113,44 @@ export function LiveFeed() {
     setIsLoading(true);
     setError(null);
     try {
+      // Stop any active stream first so the backend releases the current capture cleanly.
+      if (isStreaming) {
+        await videoAPI.stopVideo();
+        if (isMountedRef.current) {
+          setIsStreaming(false);
+        }
+      }
+
       const response = await videoAPI.uploadVideo(file);
       console.log('Video uploaded:', response);
-      // The backend automatically sets this as the video source
-      // Just start streaming
-      setStreamNonce((n) => n + 1);
-      setIsStreaming(true);
-      setVideoSource('file');
+
+      // Explicitly select the uploaded video as the current source (avoids edge-case races).
+      // Use the absolute path returned by backend.
+      if (response?.path) {
+        await videoAPI.startVideo(String(response.path));
+      }
+
+      // Start streaming the MJPEG endpoint.
+      reconnectAttemptsRef.current = 0;
+      if (isMountedRef.current) {
+        setStreamNonce((n) => n + 1);
+        setIsStreaming(true);
+        setActiveSource('file');
+      }
     } catch (error) {
       console.error('Error uploading video:', error);
+      if (isMountedRef.current) {
+        setError(error?.message || 'Failed to upload video');
+      }
       alert('Failed to upload video. Make sure the backend is running.');
     } finally {
-      setIsLoading(false);
+      if (isMountedRef.current) {
+        setIsLoading(false);
+      }
+      // Allow re-uploading the same file (otherwise onChange may not fire).
+      if (event.target) {
+        event.target.value = '';
+      }
     }
   };
 
@@ -115,16 +175,6 @@ export function LiveFeed() {
             {/* Controls */}
             <div className="flex items-center justify-between">
               <div className="flex items-center gap-3">
-                <Select value={videoSource} onValueChange={setVideoSource}>
-                  <SelectTrigger className="w-48">
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="webcam">Webcam</SelectItem>
-                    <SelectItem value="file">Upload Video File</SelectItem>
-                  </SelectContent>
-                </Select>
-                
                 <Button
                   onClick={handleStartStop}
                   disabled={isLoading}
@@ -164,6 +214,12 @@ export function LiveFeed() {
               </div>
             </div>
 
+            {error && (
+              <div className="text-sm text-red-400 bg-red-500/10 border border-red-500/20 rounded-md px-3 py-2">
+                {error}
+              </div>
+            )}
+
             {/* Video Display */}
             <div className="relative aspect-video bg-slate-950 rounded-lg overflow-hidden border border-slate-700">
               {isStreaming ? (
@@ -173,10 +229,44 @@ export function LiveFeed() {
                     alt="Live video stream"
                     className="w-full h-full object-contain"
                     onError={() => {
-                      // Sometimes the backend resets the connection while it (re)opens the capture.
-                      // Bump the querystring to force a clean reconnect.
-                      setError('Stream connection lost. Reconnecting...');
-                      window.setTimeout(() => setStreamNonce((n) => n + 1), 500);
+                      // If the backend has no selected source, infinite retries look like a stuck blank stream.
+                      // Cap retries and consult /video/status to decide whether to retry.
+                      void (async () => {
+                        const attempt = reconnectAttemptsRef.current + 1;
+                        reconnectAttemptsRef.current = attempt;
+
+                        try {
+                          const status = await videoAPI.getStatus();
+                          if (!status?.mode) {
+                            if (isMountedRef.current) {
+                              setError('No video source selected. Click Start (webcam) or Upload a video.');
+                              setIsStreaming(false);
+                            }
+                            reconnectAttemptsRef.current = 0;
+                            return;
+                          }
+                        } catch {
+                          // ignore; we will retry a few times
+                        }
+
+                        if (attempt >= 6) {
+                          if (isMountedRef.current) {
+                            setError('Stream unavailable. Try Stop then Start, or upload again.');
+                            setIsStreaming(false);
+                          }
+                          reconnectAttemptsRef.current = 0;
+                          return;
+                        }
+
+                        if (isMountedRef.current) {
+                          setError('Stream connection lost. Reconnecting...');
+                          window.setTimeout(() => {
+                            if (isMountedRef.current) {
+                              setStreamNonce((n) => n + 1);
+                            }
+                          }, 500);
+                        }
+                      })();
                     }}
                   />
                   
@@ -199,7 +289,7 @@ export function LiveFeed() {
                     </div>
                     <div className="bg-black/50 text-white text-sm px-3 py-2 rounded backdrop-blur-sm">
                       <Camera className="w-4 h-4 inline mr-2" />
-                      {videoSource === 'webcam' ? 'Webcam' : 'Video File'}
+                          {activeSource === 'webcam' ? 'Webcam' : 'Video File'}
                     </div>
                   </div>
                 </>
